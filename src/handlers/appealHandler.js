@@ -48,7 +48,7 @@ function buildAppealEmbed(formData, appeal) {
   const embed = new EmbedBuilder()
     .setColor(0x7E57C2)
     .setTitle('📋 Appeal Submission')
-    .setDescription('A banned user has submitted an appeal. Review the information below and vote.')
+    .setDescription('A flagged user has submitted an appeal. Review the information below and vote. Please keep the appeal rules in mind.')
     .setTimestamp();
 
   const responses = formData.responses || [];

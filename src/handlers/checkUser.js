@@ -19,7 +19,7 @@ const { checkDiscordUser, checkRobloxUser, checkTaseUser } = require('../utils/a
 const { isWhitelisted } = require('../utils/data');
 
 const RECENT_MS  = config.RECENT_DAYS * 24 * 60 * 60;
-const BAN_REASON = 'Automated: detected in multiple inappropriate Roblox-related servers.';
+const BAN_REASON = 'Automated: detected in Condo servers.';
 
 function isRecent(ts) {
   if (!ts || ts === 0) return false;
@@ -133,7 +133,7 @@ async function checkUser(member) {
   if (highPriority) {
     try {
       await user.send(
-        `🚫 You have been detected in multiple inappropriate servers. ` +
+        `🚫 You have been detected in condo servers. ` +
         `You have been banned. You may appeal here: **${config.APPEAL_LINK}**`
       );
     } catch (_) {}

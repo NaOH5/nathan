@@ -1,8 +1,10 @@
 /**
  * checkUser.js
- * Called every time a member joins the server.
- * Orchestrates Rotector + TaseAPI calls, determines priority,
- * auto-bans if criteria are met, and posts a log embed.
+ * Called on every guildMemberAdd.
+ * - Queries Rotector (Discord) + TaseAPI in parallel
+ * - If Roblox accounts are linked, queries Rotector (Roblox)
+ * - ONLY posts a log embed if at least one flag was found
+ * - Auto-bans if high-priority criteria are met
  */
 
 const {
@@ -16,48 +18,35 @@ const config = require('../../config');
 const { checkDiscordUser, checkRobloxUser, checkTaseUser } = require('../utils/apis');
 const { isWhitelisted } = require('../utils/data');
 
-// ─── constants ────────────────────────────────────────────────────────────────
-
-const RECENT_MS  = config.RECENT_DAYS * 24 * 60 * 60; // seconds
+const RECENT_MS  = config.RECENT_DAYS * 24 * 60 * 60;
 const BAN_REASON = 'Automated: detected in multiple inappropriate Roblox-related servers.';
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-/** Is a Unix-seconds timestamp within the recent window? */
 function isRecent(ts) {
   if (!ts || ts === 0) return false;
   return (Date.now() / 1000) - ts < RECENT_MS;
 }
 
-/** Format a Unix-seconds timestamp to a readable date, or 'Unknown'. */
 function fmtTs(ts) {
   if (!ts || ts === 0) return 'Unknown';
   return `<t:${ts}:R> (<t:${ts}:f>)`;
 }
 
-/** Truncate a string to max length for embed safety. */
 function trunc(str, max = 1024) {
   if (!str) return 'N/A';
   return String(str).length > max ? String(str).slice(0, max - 3) + '…' : String(str);
 }
 
-// ─── main export ──────────────────────────────────────────────────────────────
-
-/**
- * Run all API checks for a newly joined member and post the result log.
- * @param {GuildMember} member
- */
 async function checkUser(member) {
   const { guild, user, id: userId } = member;
   const client = guild.client;
 
   // ── 0. Whitelist check ────────────────────────────────────────────────────
-  if (isWhitelisted(userId)) return; // silently skip
+  if (isWhitelisted(userId)) return;
 
-  // ── 1. Call all APIs concurrently ─────────────────────────────────────────
+  // ── 1. Call APIs concurrently ─────────────────────────────────────────────
   let rotectorDiscord = null;
   let taseResult      = null;
-  let rotectorErrors  = [];
+  const apiErrors     = [];
 
   const [rdResult, taseRes] = await Promise.allSettled([
     checkDiscordUser(userId),
@@ -65,90 +54,89 @@ async function checkUser(member) {
   ]);
 
   if (rdResult.status === 'fulfilled') {
-    rotectorDiscord = rdResult.value; // null = clean
+    rotectorDiscord = rdResult.value;
   } else {
-    rotectorErrors.push(`Rotector Discord: ${rdResult.reason?.message || 'unknown error'}`);
+    apiErrors.push(`Rotector Discord: ${rdResult.reason?.message || 'unknown error'}`);
   }
 
   if (taseRes.status === 'fulfilled') {
-    taseResult = taseRes.value; // null = API down
+    taseResult = taseRes.value;
   } else {
-    rotectorErrors.push(`TaseAPI: ${taseRes.reason?.message || 'unknown error'}`);
+    apiErrors.push(`TaseAPI: ${taseRes.reason?.message || 'unknown error'}`);
   }
 
-  // ── 2. If ANY API completely failed, notify error channel ─────────────────
-  if (rotectorErrors.length > 0) {
+  // ── 2. Notify error channel if any API completely failed ──────────────────
+  if (apiErrors.length > 0) {
     const errCh = await client.channels.fetch(config.ERROR_CHANNEL_ID).catch(() => null);
     if (errCh) {
       errCh.send({
         embeds: [new EmbedBuilder()
           .setColor(0xFFA500)
           .setTitle('⚠️ API Failure on Member Join')
-          .setDescription(
-            `**User:** ${user.tag} (${userId})\n` +
-            `**Errors:**\n${rotectorErrors.map(e => `• ${e}`).join('\n')}`
-          )
+          .setDescription(`**User:** ${user.tag} (\`${userId}\`)\n${apiErrors.map(e => `• ${e}`).join('\n')}`)
           .setTimestamp()
         ]
       }).catch(() => {});
     }
   }
 
-  // ── 3. Roblox lookup (if Discord record has connections) ──────────────────
-  const robloxResults = [];
+  // ── 3. Roblox lookups for linked accounts ─────────────────────────────────
   const connections   = rotectorDiscord?.connections ?? [];
+  const servers       = rotectorDiscord?.servers      ?? [];
   const altAccounts   = rotectorDiscord?.altAccounts  ?? [];
-  const servers       = rotectorDiscord?.servers       ?? [];
+  const robloxResults = [];
 
   for (const conn of connections) {
     if (!conn.robloxUserId) continue;
-    let rblx = null;
-    let rblxErr = null;
-    try {
-      rblx = await checkRobloxUser(conn.robloxUserId);
-    } catch (e) {
-      rblxErr = e.message;
-    }
+    let rblx = null, rblxErr = null;
+    try { rblx = await checkRobloxUser(conn.robloxUserId); }
+    catch (e) { rblxErr = e.message; }
     robloxResults.push({ conn, data: rblx, error: rblxErr });
   }
 
-  // ── 4. Determine severity ─────────────────────────────────────────────────
+  // ── 4. Check if there are ANY flags at all ────────────────────────────────
+  const hasRotectorDiscordFlags = servers.length > 0;
+  const hasTaseFlag             = taseResult?.found === true;
+  const hasRobloxFlags          = robloxResults.some(r => r.data && r.data.flagType > 0);
+  const hasAnyFlag              = hasRotectorDiscordFlags || hasTaseFlag || hasRobloxFlags;
+
+  // Completely clean and no API errors → silent return, no log
+  if (!hasAnyFlag && apiErrors.length === 0) return;
+
+  // ── 5. Determine severity ─────────────────────────────────────────────────
   let highPriority = false;
   const triggerReasons = [];
 
-  // Discord triggers
-  if (servers.length >= config.SERVER_THRESHOLD) {
-    highPriority = true;
-    triggerReasons.push(`In **${servers.length}** flagged servers (threshold: ${config.SERVER_THRESHOLD})`);
-  }
-  const recentServer = servers.find(s => isRecent(s.updatedAt));
-  if (recentServer) {
-    highPriority = true;
-    triggerReasons.push(
-      `Recently seen in **${recentServer.serverName || recentServer.serverId}** (${fmtTs(recentServer.updatedAt)})`
-    );
+  if (hasRotectorDiscordFlags) {
+    if (servers.length >= config.SERVER_THRESHOLD) {
+      highPriority = true;
+      triggerReasons.push(`In **${servers.length}** flagged servers (threshold: ${config.SERVER_THRESHOLD})`);
+    }
+    const recentServer = servers.find(s => isRecent(s.updatedAt));
+    if (recentServer) {
+      highPriority = true;
+      triggerReasons.push(`Recently seen in **${recentServer.serverName || recentServer.serverId}** (${fmtTs(recentServer.updatedAt)})`);
+    }
   }
 
-  // Roblox triggers
   for (const { conn, data: rblx } of robloxResults) {
     if (rblx && rblx.flagType > 0 && isRecent(rblx.lastUpdated)) {
       highPriority = true;
       triggerReasons.push(
-        `Roblox account **${conn.robloxUsername || conn.robloxUserId}** flagged (type ${rblx.flagType}, ${fmtTs(rblx.lastUpdated)})`
+        `Roblox **${conn.robloxUsername || conn.robloxUserId}** flagged (type ${rblx.flagType}, ${fmtTs(rblx.lastUpdated)})`
       );
     }
   }
 
-  // ── 5. Auto-ban if high priority ──────────────────────────────────────────
+  // ── 6. Auto-ban if high priority ──────────────────────────────────────────
   let banned = false;
   if (highPriority) {
-    // DM first (fails gracefully if DMs are closed)
     try {
       await user.send(
         `🚫 You have been detected in multiple inappropriate servers. ` +
-        `You have been banned. You may appeal your ban here: **${config.APPEAL_LINK}**`
+        `You have been banned. You may appeal here: **${config.APPEAL_LINK}**`
       );
-    } catch (_) { /* DMs closed — continue */ }
+    } catch (_) {}
 
     try {
       await guild.members.ban(userId, { reason: BAN_REASON });
@@ -158,8 +146,8 @@ async function checkUser(member) {
     }
   }
 
-  // ── 6. Build log embed ────────────────────────────────────────────────────
-  const colour = highPriority ? 0xE53935 : 0x43A047;
+  // ── 7. Build log embed ────────────────────────────────────────────────────
+  const colour   = highPriority ? 0xE53935 : 0x43A047;
   const priority = highPriority ? '🔴 HIGH PRIORITY' : '🟢 LOW PRIORITY';
 
   const embed = new EmbedBuilder()
@@ -175,7 +163,7 @@ async function checkUser(member) {
       {
         name: '⚙️ Action',
         value: highPriority
-          ? (banned ? '✅ Auto-banned' : '❌ Ban failed — manual action required')
+          ? (banned ? '✅ Auto-banned' : '❌ Ban failed — manual action needed')
           : 'No auto-action taken',
         inline: true,
       }
@@ -183,16 +171,16 @@ async function checkUser(member) {
     .setTimestamp();
 
   // ── Rotector Discord ──────────────────────────────────────────────────────
-  if (rotectorDiscord) {
+  if (rdResult.status === 'rejected') {
+    embed.addFields({ name: '🕵️ Rotector — Discord', value: '⚠️ API unavailable' });
+  } else if (hasRotectorDiscordFlags) {
     const serverList = servers.slice(0, 10).map(s =>
       `• **${s.serverName || s.serverId}** — last seen ${fmtTs(s.updatedAt)}`
-    ).join('\n') || 'None';
-
+    ).join('\n');
     embed.addFields({
       name: `🕵️ Rotector — Discord (${servers.length} flagged server${servers.length !== 1 ? 's' : ''})`,
       value: trunc(serverList),
     });
-
     if (altAccounts.length > 0) {
       embed.addFields({
         name: `🔁 Alt Accounts (${altAccounts.length})`,
@@ -203,52 +191,37 @@ async function checkUser(member) {
         ),
       });
     }
-  } else if (rdResult.status === 'rejected') {
-    embed.addFields({ name: '🕵️ Rotector — Discord', value: '⚠️ API unavailable' });
-  } else {
-    embed.addFields({ name: '🕵️ Rotector — Discord', value: '✅ Not in database' });
   }
 
   // ── TaseAPI ───────────────────────────────────────────────────────────────
-  if (taseResult === null) {
+  if (taseResult === null && taseRes.status === 'rejected') {
     embed.addFields({ name: '👁️ TaseAPI', value: '⚠️ Unavailable / timed out' });
-  } else if (!taseResult.found) {
-    embed.addFields({ name: '👁️ TaseAPI', value: '✅ Not found' });
-  } else {
+  } else if (hasTaseFlag) {
     embed.addFields({
       name: '👁️ TaseAPI — Flagged',
       value: trunc(JSON.stringify(taseResult.raw, null, 2), 900),
     });
   }
 
-  // ── Roblox checks ─────────────────────────────────────────────────────────
+  // ── Roblox ────────────────────────────────────────────────────────────────
   for (const { conn, data: rblx, error } of robloxResults) {
     if (error) {
       embed.addFields({
         name: `🎮 Roblox: ${conn.robloxUsername || conn.robloxUserId}`,
         value: `⚠️ Lookup failed: ${error}`,
       });
-      continue;
-    }
-    if (!rblx) {
+    } else if (rblx && rblx.flagType > 0) {
+      const reasonLines = Object.entries(rblx.reasons ?? {}).map(([k, v]) =>
+        `**${k}**: ${v.message} (confidence: ${Math.round((v.confidence ?? 0) * 100)}%)`
+      ).join('\n') || 'No reasons listed';
       embed.addFields({
-        name: `🎮 Roblox: ${conn.robloxUsername || conn.robloxUserId}`,
-        value: '✅ Not flagged',
+        name: `🎮 Roblox: ${conn.robloxUsername || conn.robloxUserId} (ID: ${conn.robloxUserId})`,
+        value: trunc(
+          `Flag type: **${rblx.flagType}** | Confidence: **${Math.round((rblx.confidence ?? 0) * 100)}%**\n` +
+          `Last updated: ${fmtTs(rblx.lastUpdated)}\n${reasonLines}`
+        ),
       });
-      continue;
     }
-
-    const reasonLines = Object.entries(rblx.reasons ?? {}).map(([k, v]) =>
-      `**${k}**: ${v.message} (confidence: ${Math.round((v.confidence ?? 0) * 100)}%)`
-    ).join('\n') || 'No reasons listed';
-
-    embed.addFields({
-      name: `🎮 Roblox: ${conn.robloxUsername || conn.robloxUserId} (ID: ${conn.robloxUserId})`,
-      value: trunc(
-        `Flag type: **${rblx.flagType}** | Confidence: **${Math.round((rblx.confidence ?? 0) * 100)}%**\n` +
-        `Last updated: ${fmtTs(rblx.lastUpdated)}\n${reasonLines}`
-      ),
-    });
   }
 
   // ── Trigger reasons ───────────────────────────────────────────────────────
@@ -259,9 +232,8 @@ async function checkUser(member) {
     });
   }
 
-  // ── 7. Build action buttons ───────────────────────────────────────────────
+  // ── 8. Buttons ────────────────────────────────────────────────────────────
   const row = new ActionRowBuilder();
-
   if (highPriority) {
     row.addComponents(
       new ButtonBuilder()
@@ -286,7 +258,7 @@ async function checkUser(member) {
     );
   }
 
-  // ── 8. Post to log channel ────────────────────────────────────────────────
+  // ── 9. Post log ───────────────────────────────────────────────────────────
   const logCh = await client.channels.fetch(config.LOG_CHANNEL_ID).catch(() => null);
   if (logCh) {
     await logCh.send({ embeds: [embed], components: [row] }).catch(console.error);

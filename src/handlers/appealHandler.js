@@ -115,7 +115,7 @@ async function processAppeal(client, formData) {
 
   // 1. Post the embed as a normal channel message first
   const embed   = buildAppealEmbed(formData, { agree: [], disagree: [], discarded: false });
-  const message = await appealCh.send({ content: `<@&1470038369135231169>`, embeds: [embed] });
+  const message = await appealCh.send({ content: `<@&1470036796791324733>`, embeds: [embed] });
 
   // 2. Seed appeal record keyed by message ID
   createAppeal(message.id, discordId);
